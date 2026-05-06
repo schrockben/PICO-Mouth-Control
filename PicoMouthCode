@@ -1,0 +1,168 @@
+#include "switch_tinyusb.h"
+
+
+Adafruit_USBD_HID G_usb_hid;
+NSGamepad Gamepad(&G_usb_hid);
+
+
+// --- HARDWARE PINS ---
+const int SCK_PIN = 15;        
+const int DATA_PINS[3] = {12, 13, 14};
+const int JOY_SW_PIN = 16;
+
+
+// --- SENSOR TUNING ---
+long THRESHOLDS[3] = {1500000, 1500000, 2500000};
+long baselines[3] = {0, 0, 0};
+int activeCounter[3] = {0, 0, 0};
+
+
+// --- TIMERS & FLAGS ---
+unsigned long s0PuffStartTime = 0;
+unsigned long s0SipStartTime = 0;
+unsigned long stuckTimer[3] = {0, 0, 0};
+bool homeTriggered = false;
+bool plusTriggered = false;
+
+
+// --- TOGGLE STATE ---
+bool rzrHoldToggled = false; // Now latches R + ZR
+bool lastJoyState = HIGH;
+
+
+long readHX710(int pin) {
+    unsigned long timeout = millis();
+    while (digitalRead(pin) == HIGH) {
+        if (millis() - timeout > 100) return 0;
+    }
+    long count = 0;
+    for (int i = 0; i < 24; i++) {
+        digitalWrite(SCK_PIN, HIGH);
+        delayMicroseconds(1);
+        count = (count << 1);
+        digitalWrite(SCK_PIN, LOW);
+        delayMicroseconds(1);
+        if (digitalRead(pin)) count++;
+    }
+    digitalWrite(SCK_PIN, HIGH);
+    delayMicroseconds(1);
+    digitalWrite(SCK_PIN, LOW);
+    if (count & 0x800000) count |= 0xFF000000;
+    return count;
+}
+
+
+void setup() {
+    pinMode(JOY_SW_PIN, INPUT_PULLUP);
+    pinMode(SCK_PIN, OUTPUT);
+    digitalWrite(SCK_PIN, LOW);
+    for (int i = 0; i < 3; i++) pinMode(DATA_PINS[i], INPUT);
+
+
+    Gamepad.begin();
+    while(!USBDevice.mounted()) delay(1);
+
+
+    pinMode(25, OUTPUT);
+    for(int i=0; i<6; i++) { digitalWrite(25, !digitalRead(25)); delay(500); }
+
+
+    for (int i = 0; i < 3; i++) {
+        long sum = 0;
+        for (int j = 0; j < 64; j++) sum += readHX710(DATA_PINS[i]);
+        baselines[i] = sum / 64;
+    }
+    digitalWrite(25, HIGH);
+}
+
+
+void loop() {
+    // 1. CLEAR PREVIOUS BUTTONS
+    Gamepad.releaseAll();
+
+
+    // 2. JOYSTICK
+    int x = map(analogRead(26), 0, 1023, 0, 255);
+    int y = map(analogRead(27), 0, 1023, 0, 255);
+    if (abs(x - 128) < 22) x = 128;
+    if (abs(y - 128) < 22) y = 128;
+    Gamepad.leftXAxis(x);
+    Gamepad.leftYAxis(y);
+
+
+    // 3. JOYSTICK CLICK TOGGLE (R + ZR Latch)
+    bool currentJoyState = digitalRead(JOY_SW_PIN);
+    if (currentJoyState == LOW && lastJoyState == HIGH) {
+        rzrHoldToggled = !rzrHoldToggled;
+        delay(150);
+    }
+    lastJoyState = currentJoyState;
+
+
+    if (rzrHoldToggled) {
+        Gamepad.press(5); // R (Right Shoulder)
+        Gamepad.press(7); // ZR (Right Trigger)
+    }
+
+
+    // 4. SENSOR LOGIC
+    for (int i = 0; i < 3; i++) {
+        long current = readHX710(DATA_PINS[i]);
+        long diff = current - baselines[i];
+
+
+        if (abs(diff) < THRESHOLDS[i]) {
+            activeCounter[i] = 0;
+            stuckTimer[i] = 0;
+            if (i == 0) {
+                s0PuffStartTime = 0; s0SipStartTime = 0;
+                homeTriggered = false; plusTriggered = false;
+            }
+            baselines[i] = (long)((baselines[i] * 0.999) + (current * 0.001));
+        }
+        else {
+            // STUCK RECOVERY
+            if (stuckTimer[i] == 0) stuckTimer[i] = millis();
+            if (millis() - stuckTimer[i] > 5000) {
+                baselines[i] = current;
+                stuckTimer[i] = 0;
+                continue;
+            }
+
+
+            activeCounter[i]++;
+            if (activeCounter[i] > 2) {
+                // --- SENSOR 0 (GP12) ---
+                if (i == 0) {
+                    if (diff > 0) { // PUFF
+                        if (s0PuffStartTime == 0) s0PuffStartTime = millis();
+                        if (millis() - s0PuffStartTime > 3000) {
+                            if (!homeTriggered) { Gamepad.press(12); homeTriggered = true; }
+                        } else { Gamepad.press(3); } // X
+                    } else { // SIP
+                        if (s0SipStartTime == 0) s0SipStartTime = millis();
+                        if (millis() - s0SipStartTime > 3000) {
+                            if (!plusTriggered) { Gamepad.press(9); plusTriggered = true; }
+                        } else { Gamepad.press(0); } // Y
+                    }
+                }
+                // --- SENSOR 1 (GP13) ---
+                else if (i == 1) {
+                    if (diff > 0) Gamepad.press(2); // A
+                    else          Gamepad.press(1); // B
+                }
+                // --- SENSOR 2 (GP14) ---
+                else if (i == 2) {
+                    if (diff > 0) { Gamepad.press(5); Gamepad.press(7); } // Puff: R/ZR
+                    else          { Gamepad.press(4); Gamepad.press(6); } // Sip: L/ZL
+                }
+            }
+        }
+    }
+
+
+    if (Gamepad.ready()) Gamepad.loop();
+    delay(2);
+}
+
+
